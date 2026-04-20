@@ -49,10 +49,42 @@ func (s *DBStore) GetUserBalances(wallet string) ([]core.BalanceEntry, error) {
 		result = append(result, core.BalanceEntry{
 			Asset:   balance.Asset,
 			Balance: balance.Balance,
+			Enforced: balance.Enforced,
 		})
 	}
 
 	return result, nil
+}
+
+// RefreshUserEnforcedBalance recomputes the enforced balance from the user's open home channel on-chain state.
+func (s *DBStore) RefreshUserEnforcedBalance(wallet, asset string) error {
+	wallet = strings.ToLower(wallet)
+	asset = strings.ToLower(asset)
+
+	// The protocol enforces at most one open home channel per (user, asset), so
+	// the subquery matches a single row in practice. ORDER BY is added as
+	// defence-in-depth to keep the result deterministic if that invariant is
+	// ever violated.
+	err := s.db.Exec(`
+		UPDATE user_balances
+		SET enforced = COALESCE((
+			SELECT s.home_user_balance
+			FROM channels c
+			JOIN channel_states s ON s.home_channel_id = c.channel_id AND s.version = c.state_version
+			WHERE c.user_wallet = user_balances.user_wallet
+			  AND c.asset = user_balances.asset
+			  AND c.type = 1
+			  AND c.status <= 1
+			  AND c.state_version > 0
+			ORDER BY c.updated_at DESC
+			LIMIT 1
+		), 0)
+		WHERE user_wallet = ? AND asset = ?
+	`, wallet, asset).Error
+	if err != nil {
+		return fmt.Errorf("failed to refresh user locked balance: %w", err)
+	}
+	return nil
 }
 
 // LockUserState locks a user's balance row for update (postgres only, must be used within a transaction).
